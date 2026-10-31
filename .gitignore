@@ -1,0 +1,115 @@
+# ---------------------------------------------------------------
+# Secrets and local environment (never commit these)
+# ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.gpg
+*.asc
+settings-security.xml
+
+# ---------------------------------------------------------------
+# Java / Maven
+# ---------------------------------------------------------------
+*.class
+*.war
+*.nar
+*.ear
+
+# Build output: ignore everything inside each target/ folder EXCEPT the built jars
+# (so the jar files stay in the repository). Remove the "!" line to ignore jars again.
+**/target/*
+!**/target/*.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# Test and coverage output
+jacoco.exec
+*.exec
+hs_err_pid*
+*.hprof
+*.dump
+*.dumpstream
+coverage/
+
+# ---------------------------------------------------------------
+# Node / Next.js (sentinel-ui)
+# ---------------------------------------------------------------
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.vercel
+
+# ---------------------------------------------------------------
+# Archives
+# ---------------------------------------------------------------
+*.zip
+*.tar.gz
+*.rar
+
+# ---------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------
+*.log
+spring-boot-*.log
+logs/
+
+# ---------------------------------------------------------------
+# IDE and editor
+# ---------------------------------------------------------------
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------
+docker-compose.override.yml
+
+# ---------------------------------------------------------------
+# AI-assistant and tool config folders (not part of the project)
+# Documentation and knowledge files (README.md, architecture/,
+# images/, tech-guide1, tech-guide2, examples/) are NOT ignored.
+# ---------------------------------------------------------------
+.devin/
+.claude/
+.cursor/
+.windsurf/
+.aider*
+*.local.json
+
+# Scratch files
+tmp/
+.tmp/

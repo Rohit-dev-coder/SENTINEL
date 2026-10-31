@@ -1,0 +1,9 @@
+**/target
+**/node_modules
+**/.next
+**/.git
+.git
+.env
+sentinel-ui
+docs
+load-tests/target

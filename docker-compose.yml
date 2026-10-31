@@ -1,0 +1,191 @@
+services:
+  # ─── INFRASTRUCTURE ───
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sentinel-network
+
+  postgresql:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sentinel-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sentinel-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - sentinel-network
+    depends_on:
+      - sentinel-gateway
+      - sentinel-admin
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sentinel-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - sentinel-network
+
+  # ─── APPLICATION SERVICES ───
+  sentinel-gateway:
+    build:
+      context: .
+      dockerfile: sentinel-gateway/Dockerfile
+    container_name: sentinel-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresql:5432/sentinel
+      SPRING_DATASOURCE_USERNAME: sentinel
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (32+ bytes)}
+      ADMIN_URL: http://sentinel-admin:8081
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      SAMPLE_SERVICE_1_URL: http://sample-service-1:8082
+      SAMPLE_SERVICE_2_URL: http://sample-service-2:8083
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+  sentinel-admin:
+    build:
+      context: .
+      dockerfile: sentinel-admin/Dockerfile
+    container_name: sentinel-admin
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresql:5432/sentinel
+      SPRING_DATASOURCE_USERNAME: sentinel
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+  sentinel-ui:
+    build: ./sentinel-ui
+    container_name: sentinel-ui
+    ports:
+      - "3000:3000"
+    environment:
+      # Server-side only: the UI proxies /api/admin/* to the admin service and adds the key
+      ADMIN_API_URL: http://sentinel-admin:8081
+      ADMIN_HEALTH_URL: http://sentinel-admin:9081/actuator/health
+      GATEWAY_HEALTH_URL: http://sentinel-gateway:9080/actuator/health
+      PROMETHEUS_URL: http://prometheus:9090
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      UI_ADMIN_USER: ${UI_ADMIN_USER:?set UI_ADMIN_USER in .env}
+      UI_ADMIN_PASSWORD: ${UI_ADMIN_PASSWORD:?set UI_ADMIN_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (32+ chars)}
+      # Plain-HTTP local compose; remove behind TLS so the session cookie is marked Secure
+      INSECURE_COOKIES: "true"
+    depends_on:
+      - sentinel-admin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+  # ─── SAMPLE DOWNSTREAM SERVICES ───
+  sample-service-1:
+    build:
+      context: .
+      dockerfile: downstream-services/sample-service-1/Dockerfile
+    container_name: sample-service-1
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+  sample-service-2:
+    build:
+      context: .
+      dockerfile: downstream-services/sample-service-2/Dockerfile
+    container_name: sample-service-2
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+volumes:
+  pg_data:
+  grafana_data:
+
+networks:
+  sentinel-network:
+    driver: bridge

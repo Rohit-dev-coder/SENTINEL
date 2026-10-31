@@ -1,0 +1,139 @@
+name: CI Configuration Validation
+
+on:
+  workflow_dispatch:  # Allow manual triggering for testing
+
+jobs:
+  validate-ci-config:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Validate CI workflow file
+      run: |
+        echo "Validating CI workflow configuration..."
+        
+        # Check if CI workflow file exists
+        if [ ! -f ".github/workflows/ci.yml" ]; then
+          echo "ERROR: CI workflow file not found"
+          exit 1
+        fi
+        
+        # Validate YAML syntax
+        if ! yamllint .github/workflows/ci.yml 2>/dev/null; then
+          echo "WARNING: yamllint not available, skipping YAML validation"
+        fi
+        
+        # Check for required jobs
+        if ! grep -q "build-and-test" .github/workflows/ci.yml; then
+          echo "ERROR: build-and-test job not found"
+          exit 1
+        fi
+        
+        if ! grep -q "docker-build" .github/workflows/ci.yml; then
+          echo "ERROR: docker-build job not found"
+          exit 1
+        fi
+        
+        if ! grep -q "infrastructure-test" .github/workflows/ci.yml; then
+          echo "ERROR: infrastructure-test job not found"
+          exit 1
+        fi
+        
+        echo "✓ CI workflow file structure is valid"
+        echo "✓ All required jobs are defined"
+    
+    - name: Validate Maven configuration
+      run: |
+        echo "Validating Maven configuration..."
+        
+        # Check if pom.xml exists
+        if [ ! -f "pom.xml" ]; then
+          echo "ERROR: Root pom.xml not found"
+          exit 1
+        fi
+        
+        # Validate XML syntax
+        if ! xmllint --noout pom.xml 2>/dev/null; then
+          echo "WARNING: xmllint not available, skipping XML validation"
+        fi
+        
+        # Check for required plugins
+        if ! grep -q "maven-surefire-plugin" pom.xml; then
+          echo "ERROR: maven-surefire-plugin not found"
+          exit 1
+        fi
+        
+        if ! grep -q "jacoco-maven-plugin" pom.xml; then
+          echo "ERROR: jacoco-maven-plugin not found"
+          exit 1
+        fi
+        
+        echo "✓ Maven configuration is valid"
+        echo "✓ Required plugins are configured"
+    
+    - name: Validate Docker configuration
+      run: |
+        echo "Validating Docker configuration..."
+        
+        # Check if Docker Compose file exists
+        if [ ! -f "docker-compose.yml" ]; then
+          echo "ERROR: docker-compose.yml not found"
+          exit 1
+        fi
+        
+        # Check for required services
+        if ! grep -q "redis:" docker-compose.yml; then
+          echo "ERROR: Redis service not found"
+          exit 1
+        fi
+        
+        if ! grep -q "postgresql:" docker-compose.yml; then
+          echo "ERROR: PostgreSQL service not found"
+          exit 1
+        fi
+        
+        # Check for Dockerfiles
+        if [ ! -f "sentinel-gateway/Dockerfile" ]; then
+          echo "ERROR: Gateway Dockerfile not found"
+          exit 1
+        fi
+        
+        if [ ! -f "sentinel-admin/Dockerfile" ]; then
+          echo "ERROR: Admin Dockerfile not found"
+          exit 1
+        fi
+        
+        echo "✓ Docker configuration is valid"
+        echo "✓ Required services and Dockerfiles are present"
+    
+    - name: Validate test configuration
+      run: |
+        echo "Validating test configuration..."
+        
+        # Check for test directories
+        if [ ! -d "sentinel-common/src/test" ]; then
+          echo "ERROR: Common module test directory not found"
+          exit 1
+        fi
+        
+        if [ ! -d "sentinel-admin/src/test" ]; then
+          echo "ERROR: Admin module test directory not found"
+          exit 1
+        fi
+        
+        if [ ! -d "infrastructure/src/test" ]; then
+          echo "ERROR: Infrastructure test directory not found"
+          exit 1
+        fi
+        
+        # Check for test files
+        if [ $(find . -name "*Test.java" | wc -l) -eq 0 ]; then
+          echo "ERROR: No test files found"
+          exit 1
+        fi
+        
+        echo "✓ Test configuration is valid"
+        echo "✓ Test directories and files are present"

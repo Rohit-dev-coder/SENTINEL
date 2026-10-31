@@ -1,0 +1,1730 @@
+
+# 📄 Technical Design Document
+# SENTINEL — Distributed Rate Limiter & API Gateway
+### Version 1.0
+
+---
+
+# Table of Contents
+
+```
+1. Project Overview
+2. Problem Statement
+3. Key Features
+4. High-Level Design (HLD)
+   4.1 Architecture Overview
+   4.2 Service Breakdown
+   4.3 Technology Stack
+   4.4 Communication Flow
+   4.5 Rate Limiting Algorithms (All 4)
+   4.6 Redis Lua Scripts Design
+   4.7 Request Processing Pipeline
+5. Low-Level Design (LLD)
+   5.1 Gateway Service — Class Design
+   5.2 Admin Service — Class Design
+   5.3 Rate Limiter Core — Algorithm Classes
+   5.4 Redis Lua Scripts (Complete Code)
+   5.5 Database Schemas
+   5.6 Redis Key Design
+   5.7 API Specifications
+   5.8 Error Handling Strategy
+   5.9 Security Design
+6. Sample Downstream Services
+7. GitHub Repository Structure
+8. Docker Compose Setup
+9. Implementation Roadmap
+10. Resume Bullet Points
+11. Interview Q&A Preparation
+12. Future Enhancements
+```
+
+---
+
+# 1. Project Overview
+
+**Project Name:** SENTINEL (Scalable, Extensible, Network Traffic Intelligence Layer)
+
+**One-Line Description:** A distributed API Gateway with pluggable rate limiting algorithms (Token Bucket, Sliding Window Log, Fixed Window Counter, Sliding Window Counter) implemented using Redis Lua scripts for atomic distributed counting, with per-tenant configuration, circuit breaking, JWT authentication, and real-time analytics.
+
+**Author:** Rohit Kumar Jarariya [1]
+
+**Why This Name:** A sentinel guards a gate — this project guards your APIs.
+
+---
+
+# 2. Problem Statement
+
+In microservice architectures, every public-facing API needs protection from:
+
+- **Abuse** — A single user sending 10,000 requests/second to overload the system
+- **Cost Control** — Free-tier users consuming same resources as paid users
+- **Fairness** — One heavy user starving others of resources
+- **DDoS Mitigation** — Automated attacks overwhelming services
+
+Current solutions like Spring Cloud Gateway's built-in rate limiter only support **one algorithm (Token Bucket)** and have **limited configurability**. SENTINEL solves this by offering **4 pluggable algorithms** with **per-tenant, per-endpoint configuration**, all running in a **distributed** setup using **Redis Lua scripts** for atomic operations.
+
+---
+
+# 3. Key Features
+
+| ID | Feature | Description | Priority |
+|---|---|---|---|
+| F1 | **4 Rate Limiting Algorithms** | Token Bucket, Sliding Window Log, Fixed Window Counter, Sliding Window Counter — pluggable via Strategy Pattern | 🔴 Must Have |
+| F2 | **Distributed via Redis Lua** | All algorithms use Redis Lua scripts for atomic operations — works correctly across multiple gateway instances | 🔴 Must Have |
+| F3 | **Per-Tenant, Per-Endpoint Config** | Different limits for different users and endpoints — free user gets 10/min, paid gets 1000/min | 🔴 Must Have |
+| F4 | **JWT Authentication** | Validate JWT tokens, extract tenant info, API key support | 🔴 Must Have |
+| F5 | **Request Routing** | Route requests to correct downstream services based on path | 🔴 Must Have |
+| F6 | **Circuit Breaker** | If downstream service is down, fail fast instead of hanging (Resilience4j) | 🟡 Should Have |
+| F7 | **Rate Limit Analytics** | Real-time dashboard showing requests/denials per tenant, algorithm comparison | 🟡 Should Have |
+| F8 | **Load Testing Results** | Gatling load test proving system handles 10K+ requests/second | 🟡 Should Have |
+| F9 | **Monitoring** | Prometheus metrics + Grafana dashboards | 🟡 Should Have |
+| F10 | **Admin API** | CRUD for rate limit rules, tenant management | 🔴 Must Have |
+
+---
+
+# 4. High-Level Design (HLD)
+
+## 4.1 Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      SENTINEL PLATFORM                           │
+│                                                                  │
+│                                                                  │
+│   CLIENTS (Browser, Mobile, API consumers)                       │
+│       │                                                          │
+│       │  HTTP Request + JWT Token or API Key                     │
+│       ▼                                                          │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │                 GATEWAY SERVICE (Port 8080)               │   │
+│   │                                                          │   │
+│   │   ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌───────┐ │   │
+│   │   │  Auth    │→ │Rate Limit │→ │ Routing  │→ │Circuit│ │   │
+│   │   │  Filter  │  │  Filter   │  │  Filter  │  │Breaker│ │   │
+│   │   │          │  │           │  │          │  │       │ │   │
+│   │   │ JWT/API  │  │ 4 Algos   │  │ Path →   │  │Resil- │ │   │
+│   │   │ Key      │  │ Redis Lua │  │ Service  │  │ence4j │ │   │
+│   │   └──────────┘  └───────────┘  └──────────┘  └───────┘ │   │
+│   │                                                          │   │
+│   └─────────────────────────┬────────────────────────────────┘   │
+│                             │                                    │
+│              ┌──────────────┼──────────────┐                     │
+│              ▼              ▼              ▼                     │
+│   ┌──────────────┐  ┌────────────┐  ┌──────────────┐           │
+│   │ user-service │  │order-svc   │  │product-svc   │           │
+│   │ (Port 8091)  │  │(Port 8092) │  │(Port 8093)   │           │
+│   │              │  │            │  │              │           │
+│   │ Sample       │  │ Sample     │  │ Sample       │           │
+│   │ downstream   │  │ downstream │  │ downstream   │           │
+│   └──────────────┘  └────────────┘  └──────────────┘           │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │                  ADMIN SERVICE (Port 8081)                │   │
+│   │                                                          │   │
+│   │   • CRUD for rate limit rules                            │   │
+│   │   • Tenant management (create/update/delete)             │   │
+│   │   • Analytics APIs (request counts, denial rates)        │   │
+│   │   • Algorithm switching per endpoint                     │   │
+│   └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │                    INFRASTRUCTURE                         │   │
+│   │                                                          │   │
+│   │  ┌────────┐  ┌──────────┐  ┌────────────┐  ┌─────────┐ │   │
+│   │  │ Redis  │  │PostgreSQL│  │ Prometheus │  │ Grafana │ │   │
+│   │  │        │  │          │  │            │  │         │ │   │
+│   │  │Counters│  │ Tenants  │  │  Metrics   │  │Dashboard│ │   │
+│   │  │Lua     │  │ Rules    │  │  Scraping  │  │  Viz    │ │   │
+│   │  │Scripts │  │ History  │  │            │  │         │ │   │
+│   │  └────────┘  └──────────┘  └────────────┘  └─────────┘ │   │
+│   └──────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## 4.2 Service Breakdown
+
+### Service 1: Gateway Service (Port 8080)
+**The Gatekeeper** — Every request passes through here
+
+| Aspect | Details |
+|---|---|
+| **Purpose** | Authenticate, rate limit, route, and protect downstream services |
+| **Filters** | Authentication → Rate Limiting → Routing → Circuit Breaking → Response |
+| **Rate Limiting** | 4 algorithms, pluggable via Strategy Pattern, configured per tenant/endpoint |
+| **Tech** | Java 17, Spring Cloud Gateway, Spring Security, Redis, Resilience4j |
+
+### Service 2: Admin Service (Port 8081)
+**The Control Panel** — Manage rules and view analytics
+
+| Aspect | Details |
+|---|---|
+| **Purpose** | CRUD for tenants, rate limit rules, analytics, algorithm configuration |
+| **Database** | PostgreSQL for persistent config |
+| **Cache** | Redis for fast config lookups |
+| **Tech** | Java 17, Spring Boot, Spring Data JPA, Redis |
+
+### Sample Downstream Services (Ports 8091-8093)
+**Protected APIs** — Simple services sitting behind the gateway
+
+| Service | Port | Purpose |
+|---|---|---|
+| user-service | 8091 | Simple REST API: GET/POST /api/v1/users |
+| order-service | 8092 | Simple REST API: GET/POST /api/v1/orders |
+| product-service | 8093 | Simple REST API: GET/POST /api/v1/products |
+
+## 4.3 Complete Technology Stack
+
+Based on your current skills in Java, Spring Boot, and microservices [1], this project extends your profile with Redis Lua scripting, algorithm design, and gateway engineering.
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Language** | Java 17 | Core development [1] |
+| **Gateway Framework** | Spring Cloud Gateway | Reactive gateway with filter chain |
+| **Security** | Spring Security + JWT | Authentication, API key validation [1] |
+| **Rate Limit Core** | Custom implementation | 4 pluggable algorithms |
+| **Distributed State** | **Redis + Lua Scripts** | Atomic rate limit operations across instances |
+| **Config Storage** | PostgreSQL | Tenant configs, rate limit rules, audit history [1] |
+| **Config Cache** | Redis | Fast config lookups, rule caching |
+| **Resilience** | **Resilience4j** | Circuit breaker, bulkhead, retry, fallback |
+| **Load Testing** | **Gatling** | Performance testing, prove 10K+ RPS |
+| **Monitoring** | Prometheus + Grafana | Real-time rate limit metrics [1] |
+| **Logging** | SLF4J + Logback | Structured logging |
+| **Containerization** | Docker + Docker Compose | One-command startup [1] |
+| **Build Tool** | Maven | Dependency management [1] |
+| **Testing** | JUnit 5, Mockito, Testcontainers | Comprehensive testing [1] |
+| **API Docs** | Swagger / OpenAPI 3.0 | API documentation |
+| **CI/CD** | GitHub Actions | Automated build and test [1] |
+
+## 4.4 Communication Flow
+
+### Complete Request Lifecycle
+
+```
+Client sends: GET /api/v1/users
+              Header: Authorization: Bearer <jwt-token>
+       │
+       ▼
+┌──────────────────────────────────────────────────┐
+│              GATEWAY SERVICE                      │
+│                                                  │
+│  FILTER 1: AuthenticationFilter                  │
+│  ┌────────────────────────────────────────────┐  │
+│  │ • Extract JWT from Authorization header    │  │
+│  │ • Validate signature and expiry            │  │
+│  │ • Extract tenant_id and tier from claims   │  │
+│  │ • If invalid → 401 Unauthorized            │  │
+│  │ • If valid → pass to next filter           │  │
+│  └──────────────────────┬─────────────────────┘  │
+│                         │                        │
+│                         ▼                        │
+│  FILTER 2: RateLimitFilter                       │
+│  ┌────────────────────────────────────────────┐  │
+│  │ • Build rate limit key:                    │  │
+│  │   "rl:{tenant_id}:{method}:{path}"         │  │
+│  │ • Lookup config from Redis cache           │  │
+│  │   (algorithm, maxRequests, windowSeconds)   │  │
+│  │ • Execute Redis Lua script for the         │  │
+│  │   configured algorithm                     │  │
+│  │ • If ALLOWED → pass to next filter         │  │
+│  │ • If DENIED → 429 Too Many Requests        │  │
+│  │   Headers: X-RateLimit-Limit: 100          │  │
+│  │            X-RateLimit-Remaining: 0         │  │
+│  │            X-RateLimit-Reset: 1705334400    │  │
+│  │            Retry-After: 30                  │  │
+│  └──────────────────────┬─────────────────────┘  │
+│                         │                        │
+│                         ▼                        │
+│  FILTER 3: RoutingFilter                         │
+│  ┌────────────────────────────────────────────┐  │
+│  │ • Match request path to downstream service │  │
+│  │   /api/v1/users/**  → user-service:8091    │  │
+│  │   /api/v1/orders/** → order-service:8092   │  │
+│  │   /api/v1/products/** → product-svc:8093   │  │
+│  │ • Forward request to downstream            │  │
+│  └──────────────────────┬─────────────────────┘  │
+│                         │                        │
+│                         ▼                        │
+│  FILTER 4: CircuitBreakerFilter                  │
+│  ┌────────────────────────────────────────────┐  │
+│  │ • Resilience4j circuit breaker per service │  │
+│  │ • CLOSED: forward normally                 │  │
+│  │ • OPEN: return 503 immediately (fail fast) │  │
+│  │ • HALF_OPEN: allow limited requests        │  │
+│  │                                            │  │
+│  │ Config:                                    │  │
+│  │   failure-rate-threshold: 50%              │  │
+│  │   wait-duration-in-open-state: 30s         │  │
+│  │   sliding-window-size: 10                  │  │
+│  └──────────────────────┬─────────────────────┘  │
+│                         │                        │
+│                         ▼                        │
+│  FILTER 5: ResponseFilter                        │
+│  ┌────────────────────────────────────────────┐  │
+│  │ • Add rate limit headers to response       │  │
+│  │ • Log request metrics (latency, status)    │  │
+│  │ • Emit Prometheus metrics                  │  │
+│  │ • Return response to client                │  │
+│  └────────────────────────────────────────────┘  │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+## 4.5 Rate Limiting Algorithms — All 4 Explained
+
+### Algorithm 1: Token Bucket
+
+```
+┌──────────────────────────────────────────────────┐
+│              TOKEN BUCKET                         │
+│                                                  │
+│  Imagine a bucket filled with tokens (coins).     │
+│                                                  │
+│  Rules:                                          │
+│  • Bucket capacity: 10 tokens (maxRequests)       │
+│  • Refill rate: 1 token per second (refillRate)   │
+│  • Each request costs 1 token                     │
+│  • If bucket empty → REQUEST DENIED               │
+│                                                  │
+│  ┌─────────────────────────────────────────────┐ │
+│  │         🪣 BUCKET (capacity: 10)            │ │
+│  │                                             │ │
+│  │   Time 0:    🟡🟡🟡🟡🟡🟡🟡🟡🟡🟡  (10) │ │
+│  │   10 requests come in:                      │ │
+│  │   Time 0.5:  (empty)                   (0)  │ │
+│  │   Request 11: ❌ DENIED                     │ │
+│  │                                             │ │
+│  │   Time 1:    🟡                        (1)  │ │
+│  │              (1 token refilled)             │ │
+│  │   Request: ✅ ALLOWED                       │ │
+│  │                                             │ │
+│  │   Time 5:    🟡🟡🟡🟡🟡              (5)  │ │
+│  │              (5 tokens refilled)            │ │
+│  └─────────────────────────────────────────────┘ │
+│                                                  │
+│  PROS: Allows bursts (use all 10 at once)        │
+│  CONS: Doesn't guarantee smooth distribution     │
+│                                                  │
+│  Redis Data: String key with JSON value           │
+│  Key: "rl:token:{tenant}:{endpoint}"             │
+│  Value: {"tokens": 10, "lastRefill": timestamp}  │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+### Algorithm 2: Sliding Window Log
+
+```
+┌──────────────────────────────────────────────────┐
+│           SLIDING WINDOW LOG                      │
+│                                                  │
+│  Keep a log of EVERY request timestamp.           │
+│  Count requests in the last N seconds.            │
+│                                                  │
+│  Rules:                                          │
+│  • Window: 60 seconds                            │
+│  • Max: 5 requests per window                    │
+│                                                  │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  Timeline (60-second window):               │ │
+│  │                                             │ │
+│  │  12:00:00  Request 1  ✅ (1 in window)     │ │
+│  │  12:00:15  Request 2  ✅ (2 in window)     │ │
+│  │  12:00:30  Request 3  ✅ (3 in window)     │ │
+│  │  12:00:40  Request 4  ✅ (4 in window)     │ │
+│  │  12:00:50  Request 5  ✅ (5 in window)     │ │
+│  │  12:00:55  Request 6  ❌ DENIED (5 in win) │ │
+│  │                                             │ │
+│  │  12:01:01  Request 1 expires (from 12:00:00)│ │
+│  │            Now 4 in window                  │ │
+│  │            Request 7  ✅ (5 in window)      │ │
+│  └─────────────────────────────────────────────┘ │
+│                                                  │
+│  PROS: Most accurate — exact count at any moment │
+│  CONS: Memory heavy (stores every timestamp)     │
+│                                                  │
+│  Redis Data: Sorted Set                          │
+│  Key: "rl:swlog:{tenant}:{endpoint}"             │
+│  Members: request timestamps as scores           │
+│  Commands: ZADD, ZRANGEBYSCORE, ZCARD            │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+### Algorithm 3: Fixed Window Counter
+
+```
+┌──────────────────────────────────────────────────┐
+│          FIXED WINDOW COUNTER                     │
+│                                                  │
+│  Divide time into fixed windows.                  │
+│  Simple counter per window.                       │
+│                                                  │
+│  Rules:                                          │
+│  • Window: 1 minute                              │
+│  • Max: 5 requests per window                    │
+│                                                  │
+│  ┌─────────────────────────────────────────────┐ │
+│  │                                             │ │
+│  │  Window 1 (12:00-12:01):                    │ │
+│  │  12:00:00  Counter: 1  ✅                   │ │
+│  │  12:00:20  Counter: 2  ✅                   │ │
+│  │  12:00:40  Counter: 3  ✅                   │ │
+│  │  12:00:50  Counter: 4  ✅                   │ │
+│  │  12:00:55  Counter: 5  ✅                   │ │
+│  │  12:00:58  Counter: 6  ❌ DENIED            │ │
+│  │                                             │ │
+│  │  Window 2 (12:01-12:02):                    │ │
+│  │  12:01:00  Counter RESETS to 0              │ │
+│  │  12:01:01  Counter: 1  ✅                   │ │
+│  │                                             │ │
+│  │  ⚠️ THE EDGE PROBLEM:                       │ │
+│  │  12:00:59  5 requests  ✅ (end of window 1) │ │
+│  │  12:01:01  5 requests  ✅ (start of window 2)│ │
+│  │  = 10 requests in 2 seconds!                │ │
+│  └─────────────────────────────────────────────┘ │
+│                                                  │
+│  PROS: Simple, memory efficient (1 counter)      │
+│  CONS: Burst at window edges (2x limit possible) │
+│                                                  │
+│  Redis Data: String (counter)                    │
+│  Key: "rl:fixed:{tenant}:{endpoint}:{windowId}"  │
+│  Value: counter (integer)                        │
+│  TTL: window size (auto-cleanup)                 │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+### Algorithm 4: Sliding Window Counter
+
+```
+┌──────────────────────────────────────────────────┐
+│        SLIDING WINDOW COUNTER                     │
+│                                                  │
+│  Fixes the edge problem of Fixed Window.          │
+│  Uses weighted average of current + previous.     │
+│                                                  │
+│  Rules:                                          │
+│  • Window: 1 minute                              │
+│  • Max: 100 requests per window                  │
+│                                                  │
+│  ┌─────────────────────────────────────────────┐ │
+│  │                                             │ │
+│  │  Previous window (12:00-12:01): 84 requests │ │
+│  │  Current window  (12:01-12:02): 36 requests │ │
+│  │  Current time: 12:01:15                     │ │
+│  │                                             │ │
+│  │  Position in current window:                │ │
+│  │  15 seconds / 60 seconds = 25% (0.25)       │ │
+│  │                                             │ │
+│  │  Weighted count:                            │ │
+│  │  = previousCount × (1 - position) +         │ │
+│  │    currentCount                              │ │
+│  │  = 84 × (1 - 0.25) + 36                    │ │
+│  │  = 84 × 0.75 + 36                          │ │
+│  │  = 63 + 36                                  │ │
+│  │  = 99                                       │ │
+│  │                                             │ │
+│  │  99 < 100 → ✅ ALLOWED                      │ │
+│  │                                             │ │
+│  │  Next request:                              │ │
+│  │  = 63 + 37 = 100 → ❌ DENIED                │ │
+│  └─────────────────────────────────────────────┘ │
+│                                                  │
+│  PROS: Best balance of accuracy + efficiency     │
+│  CONS: Slightly approximate (not exact)          │
+│                                                  │
+│  Redis Data: Two Strings                         │
+│  Key1: "rl:sw:{tenant}:{endpoint}:{currentWin}"  │
+│  Key2: "rl:sw:{tenant}:{endpoint}:{previousWin}" │
+│  Value: counter (integer)                        │
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+### Algorithm Comparison Summary
+
+```
+┌────────────────────┬───────────┬──────────┬─────────┬───────────┐
+│                    │  Token    │ Sliding  │  Fixed  │ Sliding   │
+│                    │  Bucket   │ Win Log  │ Window  │ Win Count │
+├────────────────────┼───────────┼──────────┼─────────┼───────────┤
+│ Accuracy           │  Good     │ Perfect  │ Ok      │ Very Good │
+│ Memory Usage       │  Low      │ High     │ Very Low│ Low       │
+│ Allows Bursts      │  Yes      │ No       │ Yes     │ No        │
+│ Edge Problem       │  No       │ No       │ YES     │ No        │
+│ Redis Operations   │  1 Lua    │ 3-4 cmds │ 1 INCR  │ 1 Lua     │
+│ Best For           │  API with │ Strict   │ Simple  │ General   │
+│                    │  bursts   │ limits   │ apps    │ purpose   │
+└────────────────────┴───────────┴──────────┴─────────┴───────────┘
+```
+
+## 4.6 Redis Lua Scripts Design
+
+**Why Lua Scripts?**
+
+Without Lua scripts, rate limiting requires multiple Redis commands:
+
+```
+WITHOUT LUA (Race Condition!):
+  Thread 1: GET counter → 99
+  Thread 2: GET counter → 99
+  Thread 1: counter < 100? → YES → INCR → 100 ✅
+  Thread 2: counter < 100? → YES → INCR → 101 ✅ ← BUG! Should be DENIED!
+
+WITH LUA (Atomic — No Race Condition):
+  Thread 1: EVAL lua_script → checks AND increments in ONE operation → 100 ✅
+  Thread 2: EVAL lua_script → checks AND increments in ONE operation → 101 ❌ DENIED
+```
+
+Lua scripts execute **atomically inside Redis** — no other command can run in between. This is critical for distributed rate limiting where multiple gateway instances hit Redis simultaneously.
+
+## 4.7 Request Processing Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│           HOW A REQUEST FLOWS THROUGH SENTINEL               │
+│                                                             │
+│                                                             │
+│  Client: GET /api/v1/users                                  │
+│          Authorization: Bearer eyJhbG...                     │
+│       │                                                     │
+│       ▼                                                     │
+│  Step 1: AUTH FILTER                                        │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ • Decode JWT → extract claims                       │    │
+│  │ • claims.tenant_id = "tenant-abc"                   │    │
+│  │ • claims.tier = "PAID"                              │    │
+│  │ • claims.exp = valid (not expired)                  │    │
+│  │ • Attach tenant info to request context             │    │
+│  └─────────────────────────────────────────────────────┘    │
+│       │                                                     │
+│       ▼                                                     │
+│  Step 2: RATE LIMIT FILTER                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ • Build key: "rl:tenant-abc:GET:/api/v1/users"      │    │
+│  │ • Lookup config from Redis:                         │    │
+│  │   {algorithm: "TOKEN_BUCKET",                       │    │
+│  │    maxRequests: 1000, windowSeconds: 60}             │    │
+│  │ • Execute Lua script for TOKEN_BUCKET               │    │
+│  │ • Result: {allowed: true, remaining: 999,           │    │
+│  │            reset: 1705334460}                        │    │
+│  └─────────────────────────────────────────────────────┘    │
+│       │                                                     │
+│       ▼                                                     │
+│  Step 3: ROUTING                                            │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ • Path /api/v1/users → route to user-service:8091   │    │
+│  │ • Forward request with original headers             │    │
+│  └─────────────────────────────────────────────────────┘    │
+│       │                                                     │
+│       ▼                                                     │
+│  Step 4: CIRCUIT BREAKER                                    │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ • Circuit for user-service: CLOSED (healthy)        │    │
+│  │ • Forward request to user-service                   │    │
+│  │ • If 5 consecutive failures → circuit OPENS         │    │
+│  │ • When OPEN → return 503 immediately (30 seconds)   │    │
+│  └─────────────────────────────────────────────────────┘    │
+│       │                                                     │
+│       ▼                                                     │
+│  Step 5: RESPONSE                                           │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ • Add headers:                                      │    │
+│  │   X-RateLimit-Limit: 1000                           │    │
+│  │   X-RateLimit-Remaining: 999                        │    │
+│  │   X-RateLimit-Reset: 1705334460                     │    │
+│  │ • Emit Prometheus metrics:                          │    │
+│  │   sentinel_requests_total{tenant, endpoint, status} │    │
+│  │ • Return response to client                         │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 5. Low-Level Design (LLD)
+
+## 5.1 Gateway Service — Class Design
+
+```
+sentinel-gateway/
+└── src/main/java/com/sentinel/gateway/
+    ├── SentinelGatewayApplication.java
+    │
+    ├── filter/
+    │   ├── AuthenticationFilter.java          (JWT validation)
+    │   ├── RateLimitFilter.java               (rate limit check)
+    │   ├── ResponseHeaderFilter.java          (add rate limit headers)
+    │   └── LoggingFilter.java                 (request/response logging)
+    │
+    ├── ratelimit/
+    │   ├── RateLimiter.java                   (interface — Strategy Pattern)
+    │   ├── RateLimitResult.java               (result: allowed, remaining, reset)
+    │   ├── RateLimiterFactory.java            (creates correct algorithm instance)
+    │   │
+    │   ├── algorithm/
+    │   │   ├── TokenBucketRateLimiter.java     (Algorithm 1)
+    │   │   ├── SlidingWindowLogRateLimiter.java(Algorithm 2)
+    │   │   ├── FixedWindowCounterRateLimiter.java (Algorithm 3)
+    │   │   └── SlidingWindowCounterRateLimiter.java (Algorithm 4)
+    │   │
+    │   └── lua/
+    │       ├── TokenBucketScript.java          (Lua script loader)
+    │       ├── SlidingWindowLogScript.java
+    │       ├── FixedWindowCounterScript.java
+    │       └── SlidingWindowCounterScript.java
+    │
+    ├── auth/
+    │   ├── JwtTokenValidator.java             (validates JWT tokens)
+    │   ├── ApiKeyValidator.java               (validates API keys)
+    │   └── TenantContext.java                 (holds tenant info per request)
+    │
+    ├── config/
+    │   ├── GatewayConfig.java                 (route definitions)
+    │   ├── RedisConfig.java                   (Redis connection)
+    │   ├── ResilienceConfig.java              (circuit breaker config)
+    │   ├── SecurityConfig.java                (security settings)
+    │   └── MetricsConfig.java                 (Prometheus custom metrics)
+    │
+    ├── model/
+    │   ├── RateLimitRule.java                 (rule configuration)
+    │   ├── TenantInfo.java                    (tenant details)
+    │   └── AlgorithmType.java                 (enum: TOKEN_BUCKET, etc.)
+    │
+    ├── service/
+    │   ├── RateLimitConfigService.java        (loads configs from Redis/DB)
+    │   └── MetricsService.java                (records rate limit metrics)
+    │
+    └── exception/
+        ├── RateLimitExceededException.java
+        ├── UnauthorizedException.java
+        └── GlobalExceptionHandler.java
+```
+
+### Key Interface: RateLimiter.java (Strategy Pattern)
+
+```java
+package com.sentinel.gateway.ratelimit;
+
+/**
+ * Strategy Pattern interface for rate limiting algorithms.
+ * Each algorithm implements this interface.
+ * The correct algorithm is selected based on per-endpoint config.
+ */
+public interface RateLimiter {
+
+    /**
+     * Check if the request is allowed under the rate limit.
+     *
+     * @param key       Unique key: "tenant:method:path"
+     * @param maxRequests Maximum requests allowed in the window
+     * @param windowSeconds Duration of the rate limit window
+     * @return RateLimitResult with allowed, remaining, resetAt
+     */
+    RateLimitResult isAllowed(
+        String key, int maxRequests, int windowSeconds);
+}
+```
+
+```java
+package com.sentinel.gateway.ratelimit;
+
+public class RateLimitResult {
+    
+    private final boolean allowed;
+    private final int remaining;
+    private final long resetAt;       // Unix timestamp when limit resets
+    private final int limit;          // Max requests configured
+
+    public RateLimitResult(
+            boolean allowed, int remaining, 
+            long resetAt, int limit) {
+        this.allowed = allowed;
+        this.remaining = remaining;
+        this.resetAt = resetAt;
+        this.limit = limit;
+    }
+
+    // Getters
+    public boolean isAllowed() { return allowed; }
+    public int getRemaining() { return remaining; }
+    public long getResetAt() { return resetAt; }
+    public int getLimit() { return limit; }
+
+    // Factory methods
+    public static RateLimitResult allowed(
+            int remaining, long resetAt, int limit) {
+        return new RateLimitResult(true, remaining, resetAt, limit);
+    }
+
+    public static RateLimitResult denied(
+            long resetAt, int limit) {
+        return new RateLimitResult(false, 0, resetAt, limit);
+    }
+}
+```
+
+```java
+package com.sentinel.gateway.ratelimit;
+
+import com.sentinel.gateway.model.AlgorithmType;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+
+@Component
+public class RateLimiterFactory {
+
+    private final Map<AlgorithmType, RateLimiter> limiters;
+
+    public RateLimiterFactory(
+            TokenBucketRateLimiter tokenBucket,
+            SlidingWindowLogRateLimiter slidingLog,
+            FixedWindowCounterRateLimiter fixedWindow,
+            SlidingWindowCounterRateLimiter slidingWindow) {
+        
+        this.limiters = Map.of(
+            AlgorithmType.TOKEN_BUCKET, tokenBucket,
+            AlgorithmType.SLIDING_WINDOW_LOG, slidingLog,
+            AlgorithmType.FIXED_WINDOW_COUNTER, fixedWindow,
+            AlgorithmType.SLIDING_WINDOW_COUNTER, slidingWindow
+        );
+    }
+
+    public RateLimiter getLimiter(AlgorithmType type) {
+        RateLimiter limiter = limiters.get(type);
+        if (limiter == null) {
+            throw new IllegalArgumentException(
+                "Unknown algorithm: " + type);
+        }
+        return limiter;
+    }
+}
+```
+
+## 5.2 Admin Service — Class Design
+
+```
+sentinel-admin/
+└── src/main/java/com/sentinel/admin/
+    ├── SentinelAdminApplication.java
+    │
+    ├── controller/
+    │   ├── TenantController.java              (CRUD for tenants)
+    │   ├── RateLimitRuleController.java       (CRUD for rate limit rules)
+    │   └── AnalyticsController.java           (rate limit analytics)
+    │
+    ├── service/
+    │   ├── TenantService.java                 (tenant business logic)
+    │   ├── RateLimitRuleService.java          (rule management)
+    │   ├── RuleCacheSyncService.java          (sync rules to Redis)
+    │   └── AnalyticsService.java              (query metrics)
+    │
+    ├── model/
+    │   ├── entity/
+    │   │   ├── Tenant.java                    (JPA entity)
+    │   │   ├── RateLimitRule.java             (JPA entity)
+    │   │   └── RateLimitEvent.java            (JPA entity — audit)
+    │   └── dto/
+    │       ├── TenantRequest.java
+    │       ├── TenantResponse.java
+    │       ├── RuleRequest.java
+    │       └── RuleResponse.java
+    │
+    ├── repository/
+    │   ├── TenantRepository.java              (JPA)
+    │   ├── RateLimitRuleRepository.java       (JPA)
+    │   └── RateLimitEventRepository.java      (JPA)
+    │
+    ├── config/
+    │   ├── RedisConfig.java
+    │   └── SwaggerConfig.java
+    │
+    └── exception/
+        └── GlobalExceptionHandler.java
+```
+
+## 5.3 Rate Limiter Core — Algorithm Implementations
+
+### Algorithm 1: TokenBucketRateLimiter.java
+
+```java
+package com.sentinel.gateway.ratelimit.algorithm;
+
+import com.sentinel.gateway.ratelimit.RateLimiter;
+import com.sentinel.gateway.ratelimit.RateLimitResult;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+import java.util.Collections;
+import java.util.List;
+
+@Component
+public class TokenBucketRateLimiter implements RateLimiter {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Autowired
+    private RedisScript<List<Long>> tokenBucketScript;
+
+    @Override
+    public RateLimitResult isAllowed(
+            String key, int maxRequests, int windowSeconds) {
+
+        String redisKey = "rl:token:" + key;
+
+        // Calculate refill rate: tokens per second
+        double refillRate = (double) maxRequests / windowSeconds;
+
+        long now = System.currentTimeMillis();
+
+        // Execute Lua script atomically
+        List<Long> result = redisTemplate.execute(
+            tokenBucketScript,
+            Collections.singletonList(redisKey),
+            String.valueOf(maxRequests),          // bucket capacity
+            String.valueOf(refillRate),            // tokens per second
+            String.valueOf(now),                   // current timestamp
+            String.valueOf(windowSeconds)          // TTL for key
+        );
+
+        if (result == null || result.isEmpty()) {
+            return RateLimitResult.denied(
+                now + (windowSeconds * 1000L), maxRequests);
+        }
+
+        boolean allowed = result.get(0) == 1L;
+        int remaining = result.get(1).intValue();
+        long resetAt = now + (windowSeconds * 1000L);
+
+        if (allowed) {
+            return RateLimitResult.allowed(
+                remaining, resetAt, maxRequests);
+        } else {
+            return RateLimitResult.denied(
+                resetAt, maxRequests);
+        }
+    }
+}
+```
+
+### Algorithm 2: SlidingWindowLogRateLimiter.java
+
+```java
+package com.sentinel.gateway.ratelimit.algorithm;
+
+import com.sentinel.gateway.ratelimit.RateLimiter;
+import com.sentinel.gateway.ratelimit.RateLimitResult;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+import java.util.Collections;
+import java.util.List;
+
+@Component
+public class SlidingWindowLogRateLimiter implements RateLimiter {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Autowired
+    private RedisScript<List<Long>> slidingWindowLogScript;
+
+    @Override
+    public RateLimitResult isAllowed(
+            String key, int maxRequests, int windowSeconds) {
+
+        String redisKey = "rl:swlog:" + key;
+
+        long now = System.currentTimeMillis();
+        long windowStart = now - (windowSeconds * 1000L);
+
+        List<Long> result = redisTemplate.execute(
+            slidingWindowLogScript,
+            Collections.singletonList(redisKey),
+            String.valueOf(now),                   // current timestamp
+            String.valueOf(windowStart),           // window start
+            String.valueOf(maxRequests),            // max allowed
+            String.valueOf(windowSeconds)           // TTL
+        );
+
+        if (result == null || result.isEmpty()) {
+            return RateLimitResult.denied(
+                now + (windowSeconds * 1000L), maxRequests);
+        }
+
+        boolean allowed = result.get(0) == 1L;
+        int currentCount = result.get(1).intValue();
+        int remaining = Math.max(0, maxRequests - currentCount);
+        long resetAt = now + (windowSeconds * 1000L);
+
+        if (allowed) {
+            return RateLimitResult.allowed(
+                remaining, resetAt, maxRequests);
+        } else {
+            return RateLimitResult.denied(
+                resetAt, maxRequests);
+        }
+    }
+}
+```
+
+### Algorithm 3: FixedWindowCounterRateLimiter.java
+
+```java
+package com.sentinel.gateway.ratelimit.algorithm;
+
+import com.sentinel.gateway.ratelimit.RateLimiter;
+import com.sentinel.gateway.ratelimit.RateLimitResult;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+import java.util.Collections;
+import java.util.List;
+
+@Component
+public class FixedWindowCounterRateLimiter implements RateLimiter {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Autowired
+    private RedisScript<List<Long>> fixedWindowScript;
+
+    @Override
+    public RateLimitResult isAllowed(
+            String key, int maxRequests, int windowSeconds) {
+
+        long now = System.currentTimeMillis();
+
+        // Calculate current window ID
+        long windowId = now / (windowSeconds * 1000L);
+
+        String redisKey = "rl:fixed:" + key + ":" + windowId;
+
+        // Calculate when this window resets
+        long windowEnd = (windowId + 1) * (windowSeconds * 1000L);
+
+        List<Long> result = redisTemplate.execute(
+            fixedWindowScript,
+            Collections.singletonList(redisKey),
+            String.valueOf(maxRequests),
+            String.valueOf(windowSeconds)
+        );
+
+        if (result == null || result.isEmpty()) {
+            return RateLimitResult.denied(
+                windowEnd, maxRequests);
+        }
+
+        long currentCount = result.get(0);
+        boolean allowed = currentCount <= maxRequests;
+        int remaining = Math.max(0,
+            (int) (maxRequests - currentCount));
+
+        if (allowed) {
+            return RateLimitResult.allowed(
+                remaining, windowEnd, maxRequests);
+        } else {
+            return RateLimitResult.denied(
+                windowEnd, maxRequests);
+        }
+    }
+}
+```
+
+### Algorithm 4: SlidingWindowCounterRateLimiter.java
+
+```java
+package com.sentinel.gateway.ratelimit.algorithm;
+
+import com.sentinel.gateway.ratelimit.RateLimiter;
+import com.sentinel.gateway.ratelimit.RateLimitResult;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+import java.util.Arrays;
+import java.util.List;
+
+@Component
+public class SlidingWindowCounterRateLimiter implements RateLimiter {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Autowired
+    private RedisScript<List<Long>> slidingWindowCounterScript;
+
+    @Override
+    public RateLimitResult isAllowed(
+            String key, int maxRequests, int windowSeconds) {
+
+        long now = System.currentTimeMillis();
+        long windowSizeMs = windowSeconds * 1000L;
+
+        // Current and previous window IDs
+        long currentWindowId = now / windowSizeMs;
+        long previousWindowId = currentWindowId - 1;
+
+        String currentKey = "rl:sw:" + key + ":" + currentWindowId;
+        String previousKey = "rl:sw:" + key + ":" + previousWindowId;
+
+        // Position in current window (0.0 to 1.0)
+        double position = (double) (now % windowSizeMs) / windowSizeMs;
+
+        List<Long> result = redisTemplate.execute(
+            slidingWindowCounterScript,
+            Arrays.asList(currentKey, previousKey),
+            String.valueOf(maxRequests),
+            String.valueOf(position),
+            String.valueOf(windowSeconds)
+        );
+
+        if (result == null || result.isEmpty()) {
+            return RateLimitResult.denied(
+                now + windowSizeMs, maxRequests);
+        }
+
+        boolean allowed = result.get(0) == 1L;
+        long weightedCount = result.get(1);
+        int remaining = Math.max(0,
+            (int) (maxRequests - weightedCount));
+        long resetAt = (currentWindowId + 1) * windowSizeMs;
+
+        if (allowed) {
+            return RateLimitResult.allowed(
+                remaining, resetAt, maxRequests);
+        } else {
+            return RateLimitResult.denied(
+                resetAt, maxRequests);
+        }
+    }
+}
+```
+
+## 5.4 Redis Lua Scripts (Complete Code)
+
+### Lua Script 1: Token Bucket
+
+```lua
+-- token_bucket.lua
+-- KEYS[1] = rate limit key
+-- ARGV[1] = bucket capacity (max tokens)
+-- ARGV[2] = refill rate (tokens per second)
+-- ARGV[3] = current timestamp (milliseconds)
+-- ARGV[4] = TTL in seconds
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refillRate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+-- Get current bucket state
+local bucket = redis.call('HMGET', key, 'tokens', 'lastRefill')
+local tokens = tonumber(bucket[1])
+local lastRefill = tonumber(bucket[2])
+
+-- Initialize if first request
+if tokens == nil then
+    tokens = capacity
+    lastRefill = now
+end
+
+-- Calculate tokens to add since last refill
+local elapsed = (now - lastRefill) / 1000.0  -- convert ms to seconds
+local tokensToAdd = elapsed * refillRate
+tokens = math.min(capacity, tokens + tokensToAdd)
+
+-- Try to consume a token
+local allowed = 0
+local remaining = 0
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    allowed = 1
+    remaining = math.floor(tokens)
+else
+    allowed = 0
+    remaining = 0
+end
+
+-- Save bucket state
+redis.call('HMSET', key, 
+    'tokens', tostring(tokens), 
+    'lastRefill', tostring(now))
+redis.call('EXPIRE', key, ttl * 2)
+
+return {allowed, remaining}
+```
+
+### Lua Script 2: Sliding Window Log
+
+```lua
+-- sliding_window_log.lua
+-- KEYS[1] = rate limit key (sorted set)
+-- ARGV[1] = current timestamp
+-- ARGV[2] = window start timestamp
+-- ARGV[3] = max requests
+-- ARGV[4] = TTL in seconds
+
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local windowStart = tonumber(ARGV[2])
+local maxRequests = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+-- Remove expired entries (outside the window)
+redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+-- Count current requests in window
+local currentCount = redis.call('ZCARD', key)
+
+local allowed = 0
+
+if currentCount < maxRequests then
+    -- Add current request timestamp
+    redis.call('ZADD', key, now, tostring(now) .. ':' .. math.random(100000))
+    allowed = 1
+    currentCount = currentCount + 1
+end
+
+-- Set expiry on the key
+redis.call('EXPIRE', key, ttl * 2)
+
+return {allowed, currentCount}
+```
+
+### Lua Script 3: Fixed Window Counter
+
+```lua
+-- fixed_window_counter.lua
+-- KEYS[1] = rate limit key (includes window ID)
+-- ARGV[1] = max requests
+-- ARGV[2] = TTL in seconds
+
+local key = KEYS[1]
+local maxRequests = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+
+-- Increment counter
+local currentCount = redis.call('INCR', key)
+
+-- Set TTL on first request in this window
+if currentCount == 1 then
+    redis.call('EXPIRE', key, ttl)
+end
+
+return {currentCount}
+```
+
+### Lua Script 4: Sliding Window Counter
+
+```lua
+-- sliding_window_counter.lua
+-- KEYS[1] = current window key
+-- KEYS[2] = previous window key
+-- ARGV[1] = max requests
+-- ARGV[2] = position in current window (0.0 to 1.0)
+-- ARGV[3] = TTL in seconds
+
+local currentKey = KEYS[1]
+local previousKey = KEYS[2]
+local maxRequests = tonumber(ARGV[1])
+local position = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+-- Get counts for current and previous windows
+local currentCount = tonumber(redis.call('GET', currentKey) or '0')
+local previousCount = tonumber(redis.call('GET', previousKey) or '0')
+
+-- Calculate weighted count
+local weightedCount = previousCount * (1 - position) + currentCount
+
+local allowed = 0
+
+if weightedCount < maxRequests then
+    -- Increment current window counter
+    redis.call('INCR', currentKey)
+    redis.call('EXPIRE', currentKey, ttl * 2)
+    allowed = 1
+    weightedCount = weightedCount + 1
+end
+
+return {allowed, math.floor(weightedCount)}
+```
+
+## 5.5 Database Schemas
+
+### PostgreSQL (Admin Service)
+
+```sql
+-- TENANTS
+CREATE TABLE tenants (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(255) NOT NULL,
+    api_key         VARCHAR(255) UNIQUE NOT NULL,
+    tier            VARCHAR(20) NOT NULL DEFAULT 'FREE',
+                    -- FREE, BASIC, PREMIUM, ENTERPRISE
+    is_active       BOOLEAN DEFAULT TRUE,
+    contact_email   VARCHAR(255),
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- RATE LIMIT RULES
+CREATE TABLE rate_limit_rules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID REFERENCES tenants(id),
+    endpoint_pattern VARCHAR(255) NOT NULL,
+                    -- e.g., "GET:/api/v1/users/**"
+    algorithm       VARCHAR(30) NOT NULL DEFAULT 'TOKEN_BUCKET',
+                    -- TOKEN_BUCKET, SLIDING_WINDOW_LOG,
+                    -- FIXED_WINDOW_COUNTER, SLIDING_WINDOW_COUNTER
+    max_requests    INT NOT NULL DEFAULT 100,
+    window_seconds  INT NOT NULL DEFAULT 60,
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    
+    UNIQUE(tenant_id, endpoint_pattern)
+);
+
+-- DEFAULT RULES PER TIER (fallback if no specific rule exists)
+CREATE TABLE tier_defaults (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tier            VARCHAR(20) NOT NULL,
+    algorithm       VARCHAR(30) NOT NULL DEFAULT 'TOKEN_BUCKET',
+    max_requests    INT NOT NULL,
+    window_seconds  INT NOT NULL DEFAULT 60,
+    
+    UNIQUE(tier)
+);
+
+-- Insert default tier limits
+INSERT INTO tier_defaults (tier, max_requests, window_seconds) VALUES
+    ('FREE', 10, 60),
+    ('BASIC', 100, 60),
+    ('PREMIUM', 1000, 60),
+    ('ENTERPRISE', 10000, 60);
+
+-- RATE LIMIT EVENTS (audit log)
+CREATE TABLE rate_limit_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID REFERENCES tenants(id),
+    endpoint        VARCHAR(255),
+    algorithm       VARCHAR(30),
+    allowed         BOOLEAN,
+    remaining       INT,
+    ip_address      VARCHAR(45),
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX idx_rules_tenant ON rate_limit_rules(tenant_id);
+CREATE INDEX idx_rules_endpoint ON rate_limit_rules(endpoint_pattern);
+CREATE INDEX idx_events_tenant ON rate_limit_events(tenant_id);
+CREATE INDEX idx_events_time ON rate_limit_events(created_at);
+```
+
+## 5.6 Redis Key Design
+
+```
+# ═══════════════════════════════════════════
+# RATE LIMIT COUNTERS (per algorithm)
+# ═══════════════════════════════════════════
+
+# Token Bucket
+rl:token:{tenantId}:{method}:{path}
+  → Hash: {tokens: "8.5", lastRefill: "1705334400000"}
+  → TTL: 2 × windowSeconds
+
+# Sliding Window Log
+rl:swlog:{tenantId}:{method}:{path}
+  → Sorted Set: timestamps as scores
+  → TTL: 2 × windowSeconds
+
+# Fixed Window Counter
+rl:fixed:{tenantId}:{method}:{path}:{windowId}
+  → String: counter
+  → TTL: windowSeconds (auto-expires with window)
+
+# Sliding Window Counter
+rl:sw:{tenantId}:{method}:{path}:{windowId}
+  → String: counter for that window
+  → TTL: 2 × windowSeconds
+
+
+# ═══════════════════════════════════════════
+# CONFIG CACHE (rules loaded from PostgreSQL)
+# ═══════════════════════════════════════════
+
+config:rule:{tenantId}:{method}:{path}
+  → JSON: {algorithm, maxRequests, windowSeconds}
+  → TTL: 5 minutes (refreshes from DB periodically)
+
+config:tenant:{apiKey}
+  → JSON: {tenantId, tier, isActive}
+  → TTL: 5 minutes
+
+
+# ═══════════════════════════════════════════
+# EXAMPLE KEYS
+# ═══════════════════════════════════════════
+
+rl:token:tenant-abc:GET:/api/v1/users
+  → {tokens: "7", lastRefill: "1705334400000"}
+
+rl:swlog:tenant-xyz:POST:/api/v1/orders
+  → Sorted Set: {1705334400000, 1705334401000, ...}
+
+rl:fixed:tenant-abc:GET:/api/v1/users:28422240
+  → "45" (45 requests in this window)
+
+config:rule:tenant-abc:GET:/api/v1/users
+  → {"algorithm":"TOKEN_BUCKET","maxRequests":100,"windowSeconds":60}
+```
+
+## 5.7 API Specifications
+
+### Gateway APIs (Port 8080)
+
+```
+# All downstream APIs are proxied through the gateway
+GET    /api/v1/users/**        → routes to user-service:8091
+POST   /api/v1/users/**        → routes to user-service:8091
+GET    /api/v1/orders/**       → routes to order-service:8092
+POST   /api/v1/orders/**       → routes to order-service:8092
+GET    /api/v1/products/**     → routes to product-service:8093
+POST   /api/v1/products/**     → routes to product-service:8093
+
+# Headers added to every response:
+X-RateLimit-Limit: 100              (max allowed)
+X-RateLimit-Remaining: 95           (remaining in window)
+X-RateLimit-Reset: 1705334460       (unix timestamp when resets)
+X-RateLimit-Algorithm: TOKEN_BUCKET (which algorithm is active)
+
+# When rate limited (429):
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "message": "Too many requests. Try again in 30 seconds.",
+  "limit": 100,
+  "remaining": 0,
+  "resetAt": 1705334460
+}
+```
+
+### Admin APIs (Port 8081)
+
+```
+# ─── TENANT MANAGEMENT ───
+POST   /api/v1/admin/tenants
+       Body: {name, tier, contactEmail}
+       Response: {id, name, apiKey, tier}
+
+GET    /api/v1/admin/tenants
+       Response: [{id, name, tier, isActive}]
+
+GET    /api/v1/admin/tenants/{id}
+PUT    /api/v1/admin/tenants/{id}
+DELETE /api/v1/admin/tenants/{id}
+
+# ─── RATE LIMIT RULES ───
+POST   /api/v1/admin/rules
+       Body: {
+         tenantId, 
+         endpointPattern: "GET:/api/v1/users/**",
+         algorithm: "TOKEN_BUCKET",
+         maxRequests: 100,
+         windowSeconds: 60
+       }
+
+GET    /api/v1/admin/rules
+       Query: ?tenantId=xxx
+GET    /api/v1/admin/rules/{id}
+PUT    /api/v1/admin/rules/{id}
+DELETE /api/v1/admin/rules/{id}
+
+# ─── ANALYTICS ───
+GET    /api/v1/admin/analytics/summary
+       Query: ?tenantId=xxx&from=2025-01-01&to=2025-01-31
+       Response: {
+         totalRequests, allowedRequests, deniedRequests,
+         denialRate, topEndpoints, requestsByAlgorithm
+       }
+
+GET    /api/v1/admin/analytics/tenants/{id}/usage
+       Response: {requestsPerMinute, denialRate, topEndpoints}
+```
+
+## 5.8 Error Handling Strategy
+
+```java
+// Standard error responses
+
+// 401 Unauthorized (invalid/missing JWT)
+{
+  "error": "UNAUTHORIZED",
+  "message": "Invalid or expired token",
+  "timestamp": "2025-01-15T10:30:00Z"
+}
+
+// 429 Too Many Requests (rate limited)
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "message": "Rate limit exceeded. Try again in 30 seconds.",
+  "limit": 100,
+  "remaining": 0,
+  "resetAt": 1705334460,
+  "retryAfter": 30
+}
+
+// 503 Service Unavailable (circuit breaker open)
+{
+  "error": "SERVICE_UNAVAILABLE",
+  "message": "Downstream service is temporarily unavailable",
+  "service": "user-service",
+  "retryAfter": 30
+}
+```
+
+## 5.9 Security Design
+
+```
+Authentication Flow:
+═══════════════════
+
+Option 1: JWT Token
+  Client sends: Authorization: Bearer eyJhbG...
+  Gateway: Decode → Validate signature → Extract tenant_id, tier
+  
+Option 2: API Key
+  Client sends: X-API-Key: sk_live_abc123...
+  Gateway: Lookup in Redis → Get tenant_id, tier
+
+JWT Claims Structure:
+{
+  "sub": "tenant-abc",
+  "tenant_id": "uuid",
+  "tier": "PREMIUM",
+  "exp": 1705334460,
+  "iat": 1705330860
+}
+```
+
+---
+
+# 6. Sample Downstream Services
+
+Simple Spring Boot apps that sit behind the gateway:
+
+```
+sample-services/
+├── sample-user-service/        (Port 8091)
+│   ├── UserController.java
+│   │   GET  /api/v1/users      → returns list of users
+│   │   GET  /api/v1/users/{id} → returns single user
+│   │   POST /api/v1/users      → creates user
+│   └── application.yml
+│
+├── sample-order-service/       (Port 8092)
+│   ├── OrderController.java
+│   │   GET  /api/v1/orders     → returns list of orders
+│   │   POST /api/v1/orders     → creates order
+│   └── application.yml
+│
+└── sample-product-service/     (Port 8093)
+    ├── ProductController.java
+    │   GET  /api/v1/products   → returns list of products
+    │   POST /api/v1/products   → creates product
+    └── application.yml
+```
+
+---
+
+# 7. GitHub Repository Structure
+
+```
+sentinel/
+├── README.md
+├── LICENSE
+├── docker-compose.yml
+├── Makefile
+│
+├── docs/
+│   ├── architecture.md
+│   ├── api-specification.yaml
+│   ├── algorithm-comparison.md
+│   ├── load-test-results.md
+│   └── images/
+│
+├── sentinel-backend/
+│   ├── pom.xml                            (parent POM)
+│   │
+│   ├── sentinel-common/
+│   │   ├── pom.xml
+│   │   └── src/main/java/com/sentinel/common/
+│   │       ├── dto/
+│   │       ├── enums/
+│   │       │   └── AlgorithmType.java
+│   │       ├── exception/
+│   │       └── util/
+│   │
+│   ├── sentinel-gateway/
+│   │   ├── pom.xml
+│   │   ├── Dockerfile
+│   │   └── src/
+│   │       ├── main/
+│   │       │   ├── java/com/sentinel/gateway/
+│   │       │   │   ├── filter/
+│   │       │   │   ├── ratelimit/
+│   │       │   │   │   ├── algorithm/
+│   │       │   │   │   └── lua/
+│   │       │   │   ├── auth/
+│   │       │   │   ├── service/
+│   │       │   │   ├── config/
+│   │       │   │   └── model/
+│   │       │   └── resources/
+│   │       │       ├── application.yml
+│   │       │       └── scripts/
+│   │       │           ├── token_bucket.lua
+│   │       │           ├── sliding_window_log.lua
+│   │       │           ├── fixed_window_counter.lua
+│   │       │           └── sliding_window_counter.lua
+│   │       └── test/
+│   │
+│   ├── sentinel-admin/
+│   │   ├── pom.xml
+│   │   ├── Dockerfile
+│   │   └── src/
+│   │       ├── main/java/com/sentinel/admin/
+│   │       │   ├── controller/
+│   │       │   ├── service/
+│   │       │   ├── model/
+│   │       │   ├── repository/
+│   │       │   └── config/
+│   │       └── resources/
+│   │           └── application.yml
+│   │
+│   └── proto/                             (if adding gRPC later)
+│
+├── sample-services/
+│   ├── sample-user-service/
+│   ├── sample-order-service/
+│   └── sample-product-service/
+│
+├── load-tests/
+│   └── src/test/scala/
+│       └── com/sentinel/loadtest/
+│           ├── RateLimitSimulation.scala   (Gatling test)
+│           └── AlgorithmComparisonTest.scala
+│
+├── infrastructure/
+│   ├── k8s/
+│   │   ├── gateway-deployment.yaml
+│   │   ├── admin-deployment.yaml
+│   │   └── infra/
+│   └── monitoring/
+│       ├── prometheus.yml
+│       └── grafana/
+│           └── sentinel-dashboard.json
+│
+└── .github/
+    └── workflows/
+        └── ci.yml
+```
+
+---
+
+# 8. Docker Compose Setup
+
+```yaml
+version: '3.8'
+
+services:
+  # ─── INFRASTRUCTURE ───
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  postgresql:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel123
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sentinel-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sentinel-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=sentinel
+    depends_on:
+      - prometheus
+
+  # ─── APPLICATION SERVICES ───
+  sentinel-gateway:
+    build: ./sentinel-backend/sentinel-gateway
+    container_name: sentinel-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - postgresql
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresql:5432/sentinel
+
+  sentinel-admin:
+    build: ./sentinel-backend/sentinel-admin
+    container_name: sentinel-admin
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+      - postgresql
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgresql:5432/sentinel
+
+  # ─── SAMPLE DOWNSTREAM SERVICES ───
+  user-service:
+    build: ./sample-services/sample-user-service
+    container_name: sentinel-user-service
+    ports:
+      - "8091:8091"
+
+  order-service:
+    build: ./sample-services/sample-order-service
+    container_name: sentinel-order-service
+    ports:
+      - "8092:8092"
+
+  product-service:
+    build: ./sample-services/sample-product-service
+    container_name: sentinel-product-service
+    ports:
+      - "8093:8093"
+
+volumes:
+  pg_data:
+```
+
+---
+
+# 9. Implementation Roadmap
+
+| Week | What to Build | Deliverable |
+|---|---|---|
+| **Week 1** | Setup repo, Docker Compose, sample downstream services, PostgreSQL schema, Admin Service (tenant + rule CRUD) | Admin APIs working, 3 sample services running |
+| **Week 2** | Gateway Service foundation — Auth filter (JWT + API Key), Routing filter, Response header filter | Requests route through gateway to downstream services with auth |
+| **Week 3** | Rate Limit Core — implement all 4 algorithms with Redis Lua scripts, Strategy Pattern, RateLimiterFactory | All 4 algorithms working individually against Redis |
+| **Week 4** | Integration — connect Rate Limit filter to config service, per-tenant/per-endpoint rule lookup, Redis config caching | Full rate limiting working end-to-end per tenant per endpoint |
+| **Week 5** | Circuit Breaker (Resilience4j), Prometheus metrics, Grafana dashboard | Circuit breaker protects downstream, monitoring shows rate limit metrics |
+| **Week 6** | Gatling load tests, documentation, GitHub Actions CI/CD, README with architecture diagrams | Load test proves 10K+ RPS, project is demo-ready |
+
+---
+
+# 10. Resume Bullet Points
+
+Once built, add these to your resume:
+
+> • **Architected SENTINEL** — a distributed API Gateway with **4 pluggable rate limiting algorithms** (Token Bucket, Sliding Window Log, Fixed Window Counter, Sliding Window Counter) using Java 17, Spring Cloud Gateway, and **Redis Lua scripts** for atomic distributed counting across multiple gateway instances.
+
+> • **Implemented Strategy Pattern** for algorithm selection with per-tenant, per-endpoint configuration stored in PostgreSQL and cached in Redis, enabling dynamic algorithm switching without deployment — supporting FREE (10 req/min) to ENTERPRISE (10K req/min) tiers.
+
+> • **Engineered Redis Lua scripts** for atomic rate limit operations, eliminating race conditions in distributed environments — validated with **Gatling load tests** achieving **10,000+ requests/second** with sub-millisecond rate limit check latency.
+
+> • **Integrated Resilience4j circuit breakers** for downstream service protection with configurable failure-rate thresholds, and built real-time monitoring using **Prometheus custom metrics** and **Grafana dashboards** tracking request rates, denial rates, and algorithm performance.
+
+---
+
+# 11. Interview Q&A Preparation
+
+### Q: "Design a Rate Limiter" (THE classic question)
+
+> *"I've actually built one. Let me walk you through it. I implemented 4 algorithms — Token Bucket for burst-friendly APIs, Sliding Window Log for strict accuracy, Fixed Window Counter for simplicity, and Sliding Window Counter for the best accuracy-to-memory ratio. Each runs as a Redis Lua script for atomic distributed counting. The algorithm is configurable per tenant and per endpoint via the Strategy Pattern. I load-tested it with Gatling — 10K+ requests per second with sub-millisecond rate limit check latency."*
+
+### Q: "Why Redis Lua scripts?"
+
+> *"Without Lua, rate limiting requires GET + compare + INCR — three separate Redis commands. Between GET and INCR, another thread could modify the counter, causing a race condition. Lua scripts execute atomically inside Redis — the entire check-and-increment happens as one operation. Even with 100 gateway instances hitting Redis simultaneously, there are zero race conditions."*
+
+### Q: "Which algorithm is best?"
+
+> *"It depends. Token Bucket for APIs where bursts are acceptable — like a chat API. Sliding Window Counter for general-purpose rate limiting — best accuracy-to-memory ratio. Sliding Window Log when you need perfect accuracy and can afford the memory — like a payment API. Fixed Window Counter when simplicity matters and edge bursts are acceptable."*
+
+### Q: "How does it work across multiple gateway instances?"
+
+> *"All instances share the same Redis. Rate limit counters are stored in Redis, not in gateway memory. When any instance checks a rate limit, it executes a Lua script against the shared Redis — so the counter is always globally accurate. This is what makes it truly distributed."*
+
+---
+
+# 12. Future Enhancements
+
+| Enhancement | Description |
+|---|---|
+| **IP-based rate limiting** | Rate limit by IP address in addition to tenant |
+| **Request queuing** | Instead of denying, queue requests and process when tokens available |
+| **Geographic rate limiting** | Different limits based on client region |
+| **WebSocket support** | Rate limit WebSocket connections |
+| **GraphQL support** | Rate limit based on GraphQL query complexity |
+| **Admin Dashboard UI** | Next.js frontend for managing rules and viewing analytics |
+| **Alerting** | Slack/email alerts when a tenant hits 80% of their limit |
+| **gRPC gateway** | Support gRPC traffic in addition to HTTP |
+
+---
+
+## ✅ Document Complete!
+
+### Summary of What You're Building
+
+| Component | Details |
+|---|---|
+| **Backend Services** | 2 (Gateway + Admin) |
+| **Sample Services** | 3 (User, Order, Product) |
+| **Rate Limit Algorithms** | 4 (Token Bucket, Sliding Window Log, Fixed Window, Sliding Window Counter) |
+| **Redis Lua Scripts** | 4 (one per algorithm) |
+| **Design Patterns** | Strategy Pattern, Filter Chain, Factory Pattern |
+| **Technologies** | Java 17, Spring Cloud Gateway, Redis Lua, PostgreSQL, Resilience4j, Gatling, Prometheus, Grafana |
+
+### How This Complements CODELINE
+
+| CODELINE (Project 1) | SENTINEL (Project 2) |
+|---|---|
+| Data Governance domain | Infrastructure domain |
+| Neo4j (Graph DB) | Redis (Lua scripting) |
+| Kafka (event-driven) | Spring Cloud Gateway (request-driven) |
+| AI integration | Algorithm design |
+| Code analysis | Runtime traffic management |
+| 5 microservices | 2 services + 3 sample services |
+
+Both projects directly build on your existing Java, Spring Boot, and microservices expertise at Dell Technologies [1], while adding completely different technology dimensions to your profile.
+
+**Start with Week 1 — repo setup, Docker Compose, sample services, and Admin Service CRUD.** 🚀

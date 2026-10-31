@@ -1,0 +1,20 @@
+server:
+  port: 18090
+
+# Redis is not needed by the in-memory limiter above, but the starter's default Redis template bean is
+# still created lazily, so no connection is attempted at startup.
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+sentinel:
+  default-limit:
+    max-requests: 5
+    window-seconds: 60
+  rules:
+    - path-pattern: /api/orders/**
+      algorithm: FIXED_WINDOW_COUNTER
+      max-requests: 2
+      window-seconds: 60
